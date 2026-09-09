@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+build/
+dist/
+*.spec.bak
+
+# Local/generated test PDFs
+_*.pdf
+test_*.pdf
+!test_selective_convert.py
+!test_real_pdf.py
+!test_compression.py
+!test_magick_vs_pymupdf.py

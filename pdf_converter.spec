@@ -32,6 +32,7 @@ a = Analysis(
         "customtkinter",
         "tkinterdnd2",
         "pymupdf",
+        "pikepdf",
         "darkdetect",
         "PIL",
         "PIL._tkinter_finder",

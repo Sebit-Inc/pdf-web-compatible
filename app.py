@@ -47,7 +47,6 @@ COLORS = {
     "border":       "#2a3148",
 }
 
-APP_AUTHOR = "Ahmet BOZDOĞAN"
 APP_VERSION = "v1.0"
 
 
@@ -99,6 +98,9 @@ _DEFAULT_DPI = 250
 
 # Web uygulamasındaki PDF.js eşiği ile aynı. İleride 15000 / 20000 yapılabilir.
 VECTOR_OPERATION_THRESHOLD = 10000
+
+# Düz /Kids listesi yerine /Count ile atlanabilen dengeli ağaç.
+PAGE_TREE_FANOUT = 8
 
 # PDF.js OPS.fill / OPS.stroke / OPS.fillStroke karşılıkları (PyMuPDF path type)
 _VECTOR_DRAW_TYPES = frozenset({"f", "s", "fs"})
@@ -180,7 +182,171 @@ def _copy_document_extras(doc_in, doc_out) -> None:
         pass
 
 
-def _rasterize_page_to_doc(fitz, page, doc_out, dpi: int) -> None:
+def _pikepdf_node_count(node) -> int:
+    from pikepdf import Name
+    if node.get("/Type") == Name.Pages:
+        return int(node["/Count"])
+    return 1
+
+
+def _build_balanced_page_tree_pikepdf(
+    pdf, fanout: int = PAGE_TREE_FANOUT, result_queue=None
+) -> bool:
+    """Düz /Pages listesini pikepdf ile dengeli ağaca çevirir."""
+    from pikepdf import Array, Dictionary, Name
+
+    page_total = len(pdf.pages)
+    if result_queue is not None:
+        _progress(result_queue, 0, max(page_total, 1), "Ağaç")
+
+    nodes = []
+    for i, page in enumerate(pdf.pages):
+        nodes.append(page.obj)
+        if result_queue is not None:
+            _progress(result_queue, i + 1, page_total, "Ağaç")
+    if len(nodes) <= fanout:
+        if result_queue is not None and page_total:
+            _progress(result_queue, page_total, page_total, "Ağaç")
+        return False
+
+    first_level = True
+    while len(nodes) > 1:
+        level = []
+        done = 0
+        for i in range(0, len(nodes), fanout):
+            group = nodes[i : i + fanout]
+            if len(group) == 1:
+                level.append(group[0])
+                done += 1
+            else:
+                count = sum(_pikepdf_node_count(node) for node in group)
+                parent = pdf.make_indirect(
+                    Dictionary(
+                        Type=Name.Pages,
+                        Kids=Array(group),
+                        Count=count,
+                    )
+                )
+                for node in group:
+                    node[Name.Parent] = parent
+                    done += 1
+                    if first_level and result_queue is not None:
+                        _progress(
+                            result_queue, min(done, page_total), page_total, "Ağaç"
+                        )
+                level.append(parent)
+                continue
+            if first_level and result_queue is not None:
+                _progress(result_queue, min(done, page_total), page_total, "Ağaç")
+        if len(level) >= len(nodes):
+            break
+        nodes = level
+        first_level = False
+
+    pdf.Root[Name.Pages] = nodes[0]
+    if result_queue is not None and page_total:
+        _progress(result_queue, page_total, page_total, "Ağaç")
+    return True
+
+
+def _rewrite_tree_and_linearize(
+    src: str, dst: str, result_queue, total: int
+) -> tuple[bool, bool]:
+    """Sayfa ağacını kurup linearized kaydeder. Büyük dosyalarda PyMuPDF xref yazımı kullanmaz."""
+    try:
+        import pikepdf
+    except ImportError:
+        if src != dst:
+            shutil.copy2(src, dst)
+        return False, False
+
+    _progress(result_queue, 0, max(total, 1), "Ağaç")
+    tmp_path = f"{dst}.tmp"
+    try:
+        with pikepdf.open(src) as pdf:
+            tree_built = _build_balanced_page_tree_pikepdf(
+                pdf, result_queue=result_queue
+            )
+            last_pct = [-1]
+            page_count = len(pdf.pages)
+
+            def on_linearize_progress(percent: int) -> None:
+                if percent == last_pct[0]:
+                    return
+                last_pct[0] = percent
+                current = int(round(percent * page_count / 100)) if page_count else percent
+                _progress(result_queue, current, max(page_count, 1), "Linearize")
+
+            _progress(result_queue, 0, max(page_count, 1), "Linearize")
+            pdf.save(tmp_path, linearize=True, progress=on_linearize_progress)
+            if last_pct[0] < 100:
+                _progress(result_queue, page_count, max(page_count, 1), "Linearize")
+        os.replace(tmp_path, dst)
+        return tree_built, True
+    except Exception as exc:
+        _log(f"Tree/linearize failed ({exc})")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        if src != dst:
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+        return False, False
+
+
+def _xref_ref(xref: int) -> str:
+    return f"{xref} 0 R"
+
+
+def _is_pages_node(doc, xref: int) -> bool:
+    return doc.xref_get_key(xref, "Type") == ("name", "/Pages")
+
+
+def _page_tree_leaf_count(doc, xref: int) -> int:
+    if _is_pages_node(doc, xref):
+        kind, value = doc.xref_get_key(xref, "Count")
+        if kind == "int":
+            return int(value)
+    return 1
+
+
+def _build_balanced_page_tree(doc, fanout: int = PAGE_TREE_FANOUT) -> bool:
+    """Düz /Pages listesini, /Count ile atlanabilen dengeli ağaca çevirir."""
+    total = len(doc)
+    if total <= fanout:
+        return False
+
+    nodes = [doc[i].xref for i in range(total)]
+    while len(nodes) > 1:
+        level: list[int] = []
+        for i in range(0, len(nodes), fanout):
+            group = nodes[i : i + fanout]
+            if len(group) == 1:
+                level.append(group[0])
+                continue
+            count = sum(_page_tree_leaf_count(doc, xref) for xref in group)
+            new_xref = doc.get_new_xref()
+            kids = " ".join(_xref_ref(xref) for xref in group)
+            doc.update_object(
+                new_xref,
+                f"<< /Type /Pages /Kids [{kids}] /Count {count} >>",
+            )
+            parent_ref = _xref_ref(new_xref)
+            for xref in group:
+                doc.xref_set_key(xref, "Parent", parent_ref)
+            level.append(new_xref)
+        if level == nodes:
+            break
+        nodes = level
+
+    doc.xref_set_key(doc.pdf_catalog(), "Pages", _xref_ref(nodes[0]))
+    return True
+
+
+def _rasterize_into_page(fitz, src_page, dest_page, dpi: int) -> None:
     """
     Mevcut bitmap ayarlarını korur: seçilen DPI, RGB, alpha yok.
     Pixmap doğrudan gömülür; kayıtta Deflate (lossless) uygulanır.
@@ -188,20 +354,30 @@ def _rasterize_page_to_doc(fitz, page, doc_out, dpi: int) -> None:
     ağırlıklı sayfalarda kullanılmaz.
     """
     mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
-    rect = page.rect
-    new_page = doc_out.new_page(width=rect.width, height=rect.height)
-    new_page.insert_image(rect, pixmap=pix)
+    pix = src_page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+    dest_page.insert_image(dest_page.rect, pixmap=pix)
+
+
+def _rasterize_page_to_doc(fitz, src_page, doc_out, dpi: int) -> None:
+    rect = src_page.rect
+    dest = doc_out.new_page(width=rect.width, height=rect.height)
+    _rasterize_into_page(fitz, src_page, dest, dpi)
+
+
+def _progress(result_queue, current: int, total: int, phase: str) -> None:
+    result_queue.put(("progress", current, total, phase))
 
 
 # ─── Süreç Düzeyinde Worker (GIL'den bağımsız) ────────────────────────────────
 
 def _pdf_convert_process(input_path: str, output_path: str,
                           dpi: int,
-                          result_queue: mp.Queue) -> None:
+                          result_queue: mp.Queue,
+                          convert_all: bool = False) -> None:
     """
     Ayrı bir süreçte çalışır — Python GIL'ini ana UI thread'iyle paylaşmaz.
-    Önce operator analizi, sonra yalnızca ağır vektör sayfalar rasterize edilir.
+    Varsayılan: operator analizi, sonra yalnızca ağır vektör sayfalar rasterize edilir.
+    convert_all=True ise analiz atlanır, her sayfa bitmap'e çevrilir.
     """
     try:
         import pymupdf as fitz
@@ -210,34 +386,46 @@ def _pdf_convert_process(input_path: str, output_path: str,
         doc_in = fitz.open(input_path)
         total = len(doc_in)
 
-        _log("Analyzing PDF...")
         is_heavy: list[bool] = []
         bitmap_pages: list[int] = []
+        mode_label = "ALL PAGES" if convert_all else "SELECTIVE"
         report_lines: list[str] = [
             f"Input: {input_path}",
+            f"Mode: {mode_label}",
             f"Threshold: {VECTOR_OPERATION_THRESHOLD}",
             f"DPI: {dpi}",
             "",
-            "Analyzing PDF...",
         ]
 
-        for i, page in enumerate(doc_in):
-            try:
-                count = count_vector_operations(page)
-                fail_note = ""
-            except Exception as exc:
-                # Analiz başarısızsa eski davranış: sayfayı rasterize et
-                fail_note = f" (analysis failed: {exc})"
-                count = VECTOR_OPERATION_THRESHOLD + 1
-            heavy = count > VECTOR_OPERATION_THRESHOLD
-            is_heavy.append(heavy)
-            action = "BITMAP" if heavy else "ORIGINAL"
-            if heavy:
-                bitmap_pages.append(i + 1)
-            line = f"Page {i + 1}: {count:,} vector operations -> {action}{fail_note}"
-            _log(line)
-            report_lines.append(line)
-            result_queue.put(("progress", i + 1, total, "Analiz"))
+        if convert_all:
+            _log("Converting all pages to bitmap...")
+            report_lines.append("Converting all pages to bitmap...")
+            is_heavy = [True] * total
+            bitmap_pages = list(range(1, total + 1))
+            for i in range(total):
+                line = f"Page {i + 1}: ALL -> BITMAP"
+                _log(line)
+                report_lines.append(line)
+        else:
+            _log("Analyzing PDF...")
+            report_lines.append("Analyzing PDF...")
+            for i, page in enumerate(doc_in):
+                try:
+                    count = count_vector_operations(page)
+                    fail_note = ""
+                except Exception as exc:
+                    # Analiz başarısızsa eski davranış: sayfayı rasterize et
+                    fail_note = f" (analysis failed: {exc})"
+                    count = VECTOR_OPERATION_THRESHOLD + 1
+                heavy = count > VECTOR_OPERATION_THRESHOLD
+                is_heavy.append(heavy)
+                action = "BITMAP" if heavy else "ORIGINAL"
+                if heavy:
+                    bitmap_pages.append(i + 1)
+                line = f"Page {i + 1}: {count:,} vector operations -> {action}{fail_note}"
+                _log(line)
+                report_lines.append(line)
+                result_queue.put(("progress", i + 1, total, "Analiz"))
 
         heavy_count = sum(is_heavy)
         preserved_count = total - heavy_count
@@ -248,32 +436,57 @@ def _pdf_convert_process(input_path: str, output_path: str,
         report_lines.append(f"Heavy vector pages: {heavy_count} / {total}")
         report_lines.append(f"Bitmap page numbers: {bitmap_pages_text}")
 
-        if heavy_count == 0:
-            # Hiç ağır sayfa yoksa orijinal PDF birebir korunur
+        tree_note = "flat (copy)"
+        needs_rewrite = heavy_count > 0 or total > PAGE_TREE_FANOUT
+        if not needs_rewrite:
             shutil.copy2(input_path, output_path)
+            doc_in.close()
+        elif heavy_count == 0:
+            doc_in.close()
+            tree_built, linearized = _rewrite_tree_and_linearize(
+                input_path, output_path, result_queue, total,
+            )
+            tree_note = (
+                f"balanced fanout={PAGE_TREE_FANOUT}" if tree_built else "flat"
+            )
+            tree_note = f"{tree_note}, linearized={'yes' if linearized else 'no'}"
         else:
             doc_out = fitz.open()
-            i = 0
-            while i < total:
-                if is_heavy[i]:
-                    _rasterize_page_to_doc(fitz, doc_in[i], doc_out, dpi)
-                    result_queue.put(("progress", i + 1, total, "Sayfa"))
-                    i += 1
-                else:
-                    j = i + 1
-                    while j < total and not is_heavy[j]:
-                        j += 1
-                    # Ardışık orijinal sayfalar tek seferde kopyalanır
-                    doc_out.insert_pdf(doc_in, from_page=i, to_page=j - 1)
-                    for k in range(i, j):
-                        result_queue.put(("progress", k + 1, total, "Sayfa"))
-                    i = j
+            if heavy_count == total:
+                for i in range(total):
+                    rect = doc_in[i].rect
+                    doc_out.new_page(width=rect.width, height=rect.height)
+                for i in range(total):
+                    _rasterize_into_page(fitz, doc_in[i], doc_out[i], dpi)
+                    _progress(result_queue, i + 1, total, "Sayfa")
+            else:
+                i = 0
+                while i < total:
+                    if is_heavy[i]:
+                        _rasterize_page_to_doc(fitz, doc_in[i], doc_out, dpi)
+                        _progress(result_queue, i + 1, total, "Sayfa")
+                        i += 1
+                    else:
+                        j = i + 1
+                        while j < total and not is_heavy[j]:
+                            j += 1
+                        doc_out.insert_pdf(doc_in, from_page=i, to_page=j - 1)
+                        for k in range(i, j):
+                            _progress(result_queue, k + 1, total, "Sayfa")
+                        i = j
 
             _copy_document_extras(doc_in, doc_out)
+            doc_in.close()
+            _progress(result_queue, total, total, "Kayıt")
             doc_out.save(output_path, garbage=4, deflate=True, deflate_images=True)
             doc_out.close()
-
-        doc_in.close()
+            tree_built, linearized = _rewrite_tree_and_linearize(
+                output_path, output_path, result_queue, total,
+            )
+            tree_note = (
+                f"balanced fanout={PAGE_TREE_FANOUT}" if tree_built else "flat"
+            )
+            tree_note = f"{tree_note}, linearized={'yes' if linearized else 'no'}"
 
         final_size = os.path.getsize(output_path)
         size_lines = [
@@ -282,6 +495,7 @@ def _pdf_convert_process(input_path: str, output_path: str,
             f"Heavy vector pages: {heavy_count}",
             f"Rasterized pages: {heavy_count}",
             f"Preserved vector pages: {preserved_count}",
+            f"Page tree: {tree_note}",
             f"Final PDF size: {_format_size_mb(final_size)}",
             f"Output: {output_path}",
         ]
@@ -291,7 +505,9 @@ def _pdf_convert_process(input_path: str, output_path: str,
         report_lines.extend(size_lines)
         report_text = "\n".join(report_lines) + "\n"
 
-        if bitmap_pages:
+        if convert_all:
+            summary = f"{total} bitmap (tümü) · {_format_size_mb(final_size)}"
+        elif bitmap_pages:
             summary = (
                 f"bitmap s. {_format_page_numbers(bitmap_pages)} / "
                 f"{preserved_count} vektör · {_format_size_mb(final_size)}"
@@ -520,7 +736,12 @@ class FileRow(ctk.CTkFrame):
     def set_page_progress(self, current: int, total: int, phase: str = "Sayfa"):
         """Sayfa bazlı ilerleme: indeterminate'den determinate'e geçer."""
         pct = current / total if total > 0 else 0
-        label = f"{phase} {current} / {total}"
+        if phase == "Ağaç":
+            label = "Ağaç düzenleniyor"
+        elif phase == "Kayıt":
+            label = "Kayıt"
+        else:
+            label = f"{phase} {current} / {total}"
 
         if self.progress.cget("mode") == "indeterminate":
             self.progress.stop()
@@ -538,8 +759,8 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         super().__init__()
 
         self.title("PDF Web Dönüştürücü")
-        self.geometry("860x720")
-        self.minsize(760, 600)
+        self.geometry("920x720")
+        self.minsize(820, 600)
         self.configure(fg_color=COLORS["bg"])
         self._apply_window_icon()
 
@@ -557,6 +778,7 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         self.cancel_event = threading.Event()
         self._msg_queue: queue.Queue = queue.Queue()
         self._selected_dpi: int = _DEFAULT_DPI
+        self._convert_all = False
         self._about_window = None
 
         self._build_ui()
@@ -779,6 +1001,22 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         )
         self.add_btn.pack(side="left", padx=(0, 10))
 
+        self.convert_all_var = ctk.BooleanVar(value=False)
+        self.convert_all_switch = ctk.CTkSwitch(
+            btn_frame,
+            text="Tümünü dönüştür",
+            variable=self.convert_all_var,
+            command=self._on_convert_all_change,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=COLORS["text"],
+            fg_color=COLORS["surface2"],
+            progress_color=COLORS["accent"],
+            button_color="#e2e8f0",
+            button_hover_color=COLORS["accent_hover"],
+            width=170,
+        )
+        self.convert_all_switch.pack(side="left", padx=(0, 12))
+
         self.convert_btn = ctk.CTkButton(
             btn_frame, text="Dönüştür",
             width=148, height=42, corner_radius=12,
@@ -852,8 +1090,8 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
 
         win = ctk.CTkToplevel(self)
         win.title("Hakkında")
-        win.geometry("520x480")
-        win.minsize(460, 420)
+        win.geometry("520x460")
+        win.minsize(460, 400)
         win.configure(fg_color=COLORS["bg"])
         win.resizable(False, False)
 
@@ -889,28 +1127,16 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
             text=(
                 "Akıllı tahtalarda PDF.js ile yavaş açılan, vektör yoğun "
                 "PDF'leri web uyumlu hale getirir.\n\n"
-                "Yalnızca 10.000'den fazla vektör işlemi içeren sayfalar "
-                "bitmap'e çevrilir. Metin, görsel ve normal vektör "
-                "sayfaları orijinal halleriyle korunur."
+                "Varsayılan (seçici) modda yalnızca 10.000'den fazla "
+                "vektör işlemi içeren sayfalar bitmap'e çevrilir. "
+                "Metin, görsel ve normal vektör sayfaları korunur.\n\n"
+                "Tümünü dönüştür açıksa her sayfa bitmap'e çevrilir."
             ),
             font=ctk.CTkFont(size=13),
             text_color=COLORS["text_muted"],
             justify="center",
             wraplength=420,
         ).pack(padx=24)
-
-        meta = ctk.CTkFrame(card, fg_color=COLORS["surface2"], corner_radius=12)
-        meta.pack(fill="x", padx=24, pady=18)
-        ctk.CTkLabel(
-            meta, text="Geliştirici",
-            font=ctk.CTkFont(size=11),
-            text_color=COLORS["text_muted"],
-        ).pack(pady=(10, 0))
-        ctk.CTkLabel(
-            meta, text=APP_AUTHOR,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=COLORS["text"],
-        ).pack(pady=(0, 10))
 
         ctk.CTkButton(
             card, text="Kapat",
@@ -920,7 +1146,7 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
             text_color="white",
             font=ctk.CTkFont(size=13, weight="bold"),
             command=win.destroy,
-        ).pack(pady=(0, 20))
+        ).pack(pady=(22, 20))
 
         self._about_window = win
         win.after(50, win.focus)
@@ -942,6 +1168,9 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         except (ValueError, IndexError):
             pass
 
+    def _on_convert_all_change(self):
+        self._convert_all = bool(self.convert_all_var.get())
+
     # ── Dönüştürme ──────────────────────────────────────────────────────────
 
     def _start_conversion(self):
@@ -961,6 +1190,7 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         self.cancel_event.clear()
         self.add_btn.configure(state="disabled")
         self.empty_add_btn.configure(state="disabled")
+        self.convert_all_switch.configure(state="disabled")
         self.convert_btn.configure(
             text="İptal et",
             fg_color=COLORS["error"],
@@ -968,15 +1198,17 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         )
 
         dpi = self._selected_dpi
+        convert_all = bool(self.convert_all_var.get())
+        self._convert_all = convert_all
 
         thread = threading.Thread(
             target=self._conversion_worker,
-            args=(dpi,),
+            args=(dpi, convert_all),
             daemon=True,
         )
         thread.start()
 
-    def _conversion_worker(self, dpi: int):
+    def _conversion_worker(self, dpi: int, convert_all: bool = False):
         """
         Thread olarak çalışır; her dosya için ayrı bir multiprocessing.Process
         başlatır. Process → Queue → Thread → _msg_queue → UI köprüsü kurar.
@@ -999,7 +1231,7 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
             mp_queue: mp.Queue = mp.Queue()
             process = mp.Process(
                 target=_pdf_convert_process,
-                args=(row.file_path, out_path, dpi, mp_queue),
+                args=(row.file_path, out_path, dpi, mp_queue, convert_all),
                 daemon=True,
             )
             process.start()
@@ -1086,6 +1318,7 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
                     self.is_converting = False
                     self.add_btn.configure(state="normal")
                     self.empty_add_btn.configure(state="normal")
+                    self.convert_all_switch.configure(state="normal")
                     self.convert_btn.configure(
                         text="Dönüştür",
                         fg_color=COLORS["accent"],

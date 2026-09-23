@@ -21,6 +21,7 @@ from app import (
     QUALITY_RECOMMENDED,
     RASTER_PROFILES,
     MODE_LOSSLESS,
+    SAVE_GARBAGE,
     count_vector_operations,
     get_output_path,
     _pdf_convert_process,
@@ -600,6 +601,9 @@ class ResourcePruningTests(unittest.TestCase):
 
 
 class RasterQualityTests(unittest.TestCase):
+    def test_save_does_not_use_max_garbage(self):
+        """PDF24 tarzı karmaşık dosyalarda garbage=4 kayıt hiç bitmiyordu."""
+        self.assertLessEqual(SAVE_GARBAGE, 2)
     def test_rasterized_pages_are_embedded_as_jpeg(self):
         with tempfile.TemporaryDirectory(prefix="pdfvec_") as tmpdir:
             src = os.path.join(tmpdir, "heavy.pdf")

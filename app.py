@@ -10,6 +10,8 @@ import sys
 import shutil
 import hashlib
 import threading
+import traceback
+import time
 import queue
 import multiprocessing as mp
 from dataclasses import dataclass, asdict
@@ -193,7 +195,10 @@ DIAGNOSIS_HINTS = {
     "unknown": "Dosyanın yapısı ölçülemedi. Dönüştürme yine denenebilir.",
 }
 
-# Raster kalite profilleri. "recommended" render çözünürlüğünü kaynağın kendi
+# PyMuPDF garbage=4 karmaşık PDF24 dosyalarında dakikalarca/hiç bitmeden
+# xref tarar. pikepdf zaten dosyayı yeniden yazdığı için 1 yeter.
+SAVE_GARBAGE = 1
+INSERT_CHUNK = 16
 # görsel çözünürlüğüyle sınırlar: kaynakta olmayan detay için byte harcamaz.
 QUALITY_RECOMMENDED = "recommended"
 RASTER_MIN_DPI = 150
@@ -1020,27 +1025,33 @@ def _write_selective_raster(input_path: str, output_path: str,
                 rect = doc_in[index].rect
                 doc_out.new_page(width=rect.width, height=rect.height)
             for index in range(total):
+                _progress(result_queue, index + 1, total, "Raster")
                 _rasterize_into_page(fitz, doc_in[index], doc_out[index], dpi, quality)
                 _progress(result_queue, index + 1, total, "Sayfa")
         else:
             index = 0
             while index < total:
                 if is_heavy[index]:
+                    _progress(result_queue, index + 1, total, "Raster")
                     _rasterize_page_to_doc(fitz, doc_in[index], doc_out, dpi, quality)
                     _progress(result_queue, index + 1, total, "Sayfa")
                     index += 1
-                else:
-                    end = index + 1
-                    while end < total and not is_heavy[end]:
-                        end += 1
-                    doc_out.insert_pdf(doc_in, from_page=index, to_page=end - 1)
-                    for page_index in range(index, end):
-                        _progress(result_queue, page_index + 1, total, "Sayfa")
-                    index = end
+                    continue
+                end = index + 1
+                while (
+                    end < total
+                    and not is_heavy[end]
+                    and (end - index) < INSERT_CHUNK
+                ):
+                    end += 1
+                doc_out.insert_pdf(doc_in, from_page=index, to_page=end - 1)
+                for page_index in range(index, end):
+                    _progress(result_queue, page_index + 1, total, "Sayfa")
+                index = end
 
         _copy_document_extras(doc_in, doc_out)
         _progress(result_queue, total, total, "Kayıt")
-        doc_out.save(output_path, garbage=4, deflate=True, deflate_images=True)
+        doc_out.save(output_path, garbage=SAVE_GARBAGE, deflate=True)
     finally:
         doc_out.close()
         doc_in.close()
@@ -1124,25 +1135,31 @@ def _pdf_convert_process(input_path: str, output_path: str,
                 _log(line)
                 report_lines.append(line)
         elif analyze_vectors:
-            _log("Analyzing PDF...")
-            report_lines.append("Analyzing PDF...")
-            for i, page in enumerate(doc_in):
-                try:
-                    count = count_vector_operations(page)
-                    fail_note = ""
-                except Exception as exc:
-                    # Analiz başarısızsa eski davranış: sayfayı rasterize et
-                    fail_note = f" (analysis failed: {exc})"
-                    count = VECTOR_OPERATION_THRESHOLD + 1
-                heavy = count > VECTOR_OPERATION_THRESHOLD
-                is_heavy.append(heavy)
-                action = "BITMAP" if heavy else "ORIGINAL"
-                if heavy:
-                    bitmap_pages.append(i + 1)
-                line = f"Page {i + 1}: {count:,} vector operations -> {action}{fail_note}"
-                _log(line)
-                report_lines.append(line)
-                result_queue.put(("progress", i + 1, total, "Analiz"))
+            if mode == MODE_AUTO and not diagnosis.heavy_vector:
+                is_heavy = [False] * total
+                report_lines.append(
+                    "Vector sample found no heavy pages; skipping full page scan."
+                )
+            else:
+                _log("Analyzing PDF...")
+                report_lines.append("Analyzing PDF...")
+                for i, page in enumerate(doc_in):
+                    try:
+                        count = count_vector_operations(page)
+                        fail_note = ""
+                    except Exception as exc:
+                        # Analiz başarısızsa eski davranış: sayfayı rasterize et
+                        fail_note = f" (analysis failed: {exc})"
+                        count = VECTOR_OPERATION_THRESHOLD + 1
+                    heavy = count > VECTOR_OPERATION_THRESHOLD
+                    is_heavy.append(heavy)
+                    action = "BITMAP" if heavy else "ORIGINAL"
+                    if heavy:
+                        bitmap_pages.append(i + 1)
+                    line = f"Page {i + 1}: {count:,} vector operations -> {action}{fail_note}"
+                    _log(line)
+                    report_lines.append(line)
+                    result_queue.put(("progress", i + 1, total, "Analiz"))
         else:
             is_heavy = [False] * total
             report_lines.append("Lossless repair only; no page rasterized.")
@@ -1266,7 +1283,9 @@ def _pdf_convert_process(input_path: str, output_path: str,
         ))
 
     except Exception as e:
-        result_queue.put(("error", str(e)[:200]))
+        detail = traceback.format_exc()
+        _log(f"Convert failed: {e}")
+        result_queue.put(("error", str(e)[:300], detail))
 
 
 # ─── Yardımcı Fonksiyonlar ────────────────────────────────────────────────────
@@ -1377,7 +1396,7 @@ class FileRow(ctk.CTkFrame):
     STATUS_ERROR   = "hata"
     STATUS_CANCEL  = "iptal"
 
-    def __init__(self, master, file_path: str, on_remove, **kwargs):
+    def __init__(self, master, file_path: str, on_remove, on_convert, on_cancel, **kwargs):
         super().__init__(
             master,
             fg_color=COLORS["card"],
@@ -1388,6 +1407,8 @@ class FileRow(ctk.CTkFrame):
         )
         self.file_path = file_path
         self.on_remove = on_remove
+        self.on_convert = on_convert
+        self.on_cancel = on_cancel
         self.status = self.STATUS_WAIT
         self.report_text = ""
         self.output_path: Optional[str] = None
@@ -1496,6 +1517,21 @@ class FileRow(ctk.CTkFrame):
         self.mode_menu.pack(side="left", padx=(0, 6))
         self.mode_tip = Tooltip(self.mode_menu, _mode_hint_text(MODE_AUTO))
 
+        self.action_btn = ctk.CTkButton(
+            actions, text="Dönüştür", width=88, height=32, corner_radius=10,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            text_color="white",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._on_action,
+        )
+        self.action_btn.pack(side="left", padx=(0, 6))
+        Tooltip(
+            self.action_btn,
+            "Yalnızca bu dosyayı dönüştürür. Çalışırken İptal'e döner; diğer"
+            " dosyalar beklemeye devam eder.",
+        )
+
         self.report_btn = ctk.CTkButton(
             actions, text="Rapor", width=72, height=32, corner_radius=10,
             fg_color=COLORS["surface2"],
@@ -1528,6 +1564,12 @@ class FileRow(ctk.CTkFrame):
         self.remove_btn.pack(side="left")
 
     # ── Teşhis ve sonuç göstergeleri ────────────────────────────────────────
+
+    def _on_action(self):
+        if self.status == self.STATUS_RUNNING:
+            self.on_cancel(self)
+        else:
+            self.on_convert(self)
 
     def selected_mode(self) -> str:
         label = self.mode_var.get()
@@ -1611,11 +1653,14 @@ class FileRow(ctk.CTkFrame):
     def set_status(self, status: str, message: str = ""):
         self.status = status
         done_text = "Tamamlandı"
+        error_text = "Hata"
+        if status == self.STATUS_ERROR and message:
+            error_text = "Hata"
         styles = {
             self.STATUS_WAIT:    (COLORS["surface2"], COLORS["text_muted"], "Bekliyor"),
             self.STATUS_RUNNING: (COLORS["accent_soft"], COLORS["accent"], "Başladı"),
             self.STATUS_DONE:    (COLORS["success_soft"], COLORS["success"], done_text),
-            self.STATUS_ERROR:   (COLORS["error_soft"], COLORS["error"], f"Hata: {message}"),
+            self.STATUS_ERROR:   (COLORS["error_soft"], COLORS["error"], error_text),
             self.STATUS_CANCEL:  (COLORS["warning_soft"], COLORS["warning"], "İptal"),
         }
         pill_bg, color, label = styles.get(
@@ -1633,6 +1678,12 @@ class FileRow(ctk.CTkFrame):
             self.progress.start()
             self.remove_btn.configure(state="disabled")
             self.mode_menu.configure(state="disabled")
+            self.action_btn.configure(
+                text="İptal",
+                fg_color=COLORS["error"],
+                hover_color="#dc2626",
+                state="normal",
+            )
             self.configure(border_color=COLORS["accent"])
         elif status == self.STATUS_DONE:
             self.progress.stop()
@@ -1640,6 +1691,12 @@ class FileRow(ctk.CTkFrame):
             self.progress.set(1)
             self.remove_btn.configure(state="normal")
             self.mode_menu.configure(state="normal")
+            self.action_btn.configure(
+                text="Dönüştür",
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                state="normal",
+            )
             self.open_btn.configure(
                 state="normal",
                 fg_color=COLORS["surface2"],
@@ -1651,19 +1708,41 @@ class FileRow(ctk.CTkFrame):
             self.progress.configure(mode="determinate", progress_color=COLORS["error"])
             self.remove_btn.configure(state="normal")
             self.mode_menu.configure(state="normal")
+            self.action_btn.configure(
+                text="Yeniden dene",
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                state="normal",
+            )
             self.configure(border_color=COLORS["error"])
+            if message:
+                self.detail_label.configure(text=f"Hata: {message}")
+                if not self.detail_label.winfo_ismapped():
+                    self.detail_label.pack(fill="x", pady=(6, 0))
         elif status == self.STATUS_CANCEL:
             self.progress.stop()
             self.progress.configure(mode="determinate", progress_color=COLORS["warning"])
             self.remove_btn.configure(state="normal")
             self.mode_menu.configure(state="normal")
+            self.action_btn.configure(
+                text="Dönüştür",
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                state="normal",
+            )
             self.configure(border_color=COLORS["warning_soft"])
         else:
             self.remove_btn.configure(state="normal")
             self.mode_menu.configure(state="normal")
+            self.action_btn.configure(
+                text="Dönüştür",
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                state="normal",
+            )
             self.configure(border_color=COLORS["border"])
 
-        if status != self.STATUS_DONE:
+        if status in (self.STATUS_WAIT, self.STATUS_RUNNING, self.STATUS_CANCEL):
             self.report_text = ""
             self.report_btn.configure(
                 state="disabled",
@@ -1675,7 +1754,7 @@ class FileRow(ctk.CTkFrame):
                 fg_color=COLORS["surface2"],
                 text_color=COLORS["text_muted"],
             )
-            if self.detail_label.winfo_ismapped():
+            if status != self.STATUS_RUNNING and self.detail_label.winfo_ismapped():
                 self.detail_label.pack_forget()
 
     def set_report(self, report_text: str):
@@ -1729,7 +1808,8 @@ class FileRow(ctk.CTkFrame):
         textbox.configure(state="disabled")
         self._report_window = win
 
-    def set_page_progress(self, current: int, total: int, phase: str = "Sayfa"):
+    def set_page_progress(self, current: int, total: int, phase: str = "Sayfa",
+                         elapsed: Optional[int] = None):
         """Sayfa bazlı ilerleme: indeterminate'den determinate'e geçer."""
         pct = current / total if total > 0 else 0
         if phase == "Ağaç":
@@ -1738,8 +1818,12 @@ class FileRow(ctk.CTkFrame):
             label = "Teşhis ediliyor"
         elif phase == "Kayıt":
             label = "Kayıt"
+        elif phase == "Raster":
+            label = f"Sayfa çiziliyor {current} / {total}"
         else:
             label = f"{phase} {current} / {total}"
+        if elapsed and elapsed >= 8:
+            label = f"{label}  ·  {elapsed} sn"
 
         if self.progress.cget("mode") == "indeterminate":
             self.progress.stop()
@@ -1774,6 +1858,8 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         self.output_dir: Optional[str] = None
         self.is_converting = False
         self.cancel_event = threading.Event()
+        self.abort_batch = threading.Event()
+        self._current_row = None
         self._msg_queue: queue.Queue = queue.Queue()
         self._selected_dpi: int = _DEFAULT_DPI
         self._quality: str = QUALITY_RECOMMENDED
@@ -2121,7 +2207,12 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         if self.empty_card.winfo_ismapped():
             self.empty_card.grid_forget()
 
-        row = FileRow(self.scroll_frame, path, on_remove=self._remove_file)
+        row = FileRow(
+            self.scroll_frame, path,
+            on_remove=self._remove_file,
+            on_convert=self._convert_row,
+            on_cancel=self._cancel_row,
+        )
         row.grid(row=len(self.file_rows), column=0, sticky="ew", pady=(0, 8), padx=2)
         row.mode_var.set(self.bulk_mode_var.get())
         row.refresh_mode_hint()
@@ -2410,33 +2501,71 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
 
     # ── Dönüştürme ──────────────────────────────────────────────────────────
 
-    def _start_conversion(self):
-        if self.is_converting:
-            self.cancel_event.set()
+    def _pending_jobs(self, rows: Optional[list] = None) -> list:
+        jobs = []
+        for row in rows or self.file_rows:
+            if row.status in (FileRow.STATUS_RUNNING, FileRow.STATUS_DONE):
+                continue
+            jobs.append((row, row.selected_mode()))
+        return jobs
+
+    def _set_busy(self, busy: bool) -> None:
+        self.is_converting = busy
+        add_state = "disabled" if busy else "normal"
+        self.add_btn.configure(state=add_state)
+        self.empty_add_btn.configure(state=add_state)
+        self.bulk_mode_menu.configure(state=add_state)
+        if busy:
+            self.convert_btn.configure(
+                text="İptal et",
+                fg_color=COLORS["error"],
+                hover_color="#dc2626",
+            )
+        else:
             self.convert_btn.configure(
                 text="Dönüştür",
                 fg_color=COLORS["accent"],
                 hover_color=COLORS["accent_hover"],
             )
+            self._current_row = None
+        for row in self.file_rows:
+            if busy and row.status != FileRow.STATUS_RUNNING:
+                row.action_btn.configure(state="disabled")
+            elif not busy:
+                row.action_btn.configure(state="normal")
+
+    def _convert_row(self, row: FileRow) -> None:
+        """Satırdaki Dönüştür: yalnızca bu dosya. Çalışıyorsa yok sayılır."""
+        if self.is_converting:
+            return
+        if row.status == FileRow.STATUS_RUNNING:
+            return
+        self._begin_jobs([(row, row.selected_mode())])
+
+    def _cancel_row(self, row: FileRow) -> None:
+        """Satırdaki İptal: yalnızca o an işlenen dosyayı durdurur, kuyruk devam eder."""
+        if not self.is_converting:
+            return
+        if row is self._current_row or row.status == FileRow.STATUS_RUNNING:
+            self.cancel_event.set()
+
+    def _start_conversion(self):
+        if self.is_converting:
+            # Toplu iptal: çalışan dosya dursun, kalanlar beklemeye geri dönsün
+            self.abort_batch.set()
+            self.cancel_event.set()
+            self.convert_btn.configure(text="İptal ediliyor…")
             return
 
-        if not self.file_rows:
+        jobs = self._pending_jobs()
+        if not jobs:
             return
+        self._begin_jobs(jobs)
 
-        self.is_converting = True
+    def _begin_jobs(self, jobs: list) -> None:
         self.cancel_event.clear()
-        self.add_btn.configure(state="disabled")
-        self.empty_add_btn.configure(state="disabled")
-        self.bulk_mode_menu.configure(state="disabled")
-        self.convert_btn.configure(
-            text="İptal et",
-            fg_color=COLORS["error"],
-            hover_color="#dc2626",
-        )
-
-        # Mod satır menülerinden okunur; her dosya kendi teşhisine göre işlenir
-        jobs = [(row, row.selected_mode()) for row in self.file_rows]
-
+        self.abort_batch.clear()
+        self._set_busy(True)
         thread = threading.Thread(
             target=self._conversion_worker,
             args=(self._selected_dpi, self._quality, jobs),
@@ -2452,21 +2581,22 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         """
         done = 0
         errors = 0
+        cancelled = 0
         total_jobs = len(jobs)
-        output_folders: set[str] = set()  # başarıyla dönüştürülen klasörler
+        output_folders: set[str] = set()
 
         for index, (row, mode) in enumerate(jobs):
-            if self.cancel_event.is_set():
-                self._msg_queue.put(("status", row, FileRow.STATUS_CANCEL, ""))
-                continue
+            if self.abort_batch.is_set():
+                break
 
+            self.cancel_event.clear()
+            self._current_row = row
             out_path = get_output_path(row.file_path, dpi, self.output_dir)
             self._msg_queue.put(("status", row, FileRow.STATUS_RUNNING, ""))
             self._msg_queue.put((
                 "bulk", f"{index + 1}/{total_jobs} dosya  ·  {done} tamamlandı",
             ))
 
-            # Ayrı süreç başlat
             mp_queue: mp.Queue = mp.Queue()
             process = mp.Process(
                 target=_pdf_convert_process,
@@ -2475,32 +2605,61 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
             )
             process.start()
 
-            # Process'ten gelen mesajları köprüle → _msg_queue
             file_done = False
+            last_progress = ("Sayfa", 0, 1)
+            last_beat = time.time()
+            started = time.time()
             while not file_done:
                 if self.cancel_event.is_set():
                     process.terminate()
                     process.join(timeout=3)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=2)
                     self._msg_queue.put(("status", row, FileRow.STATUS_CANCEL, ""))
+                    cancelled += 1
                     file_done = True
                     break
 
                 try:
-                    msg = mp_queue.get(timeout=0.08)  # 80ms bekleme
+                    msg = mp_queue.get(timeout=0.2)
                 except Exception:
-                    # Queue boş — process hâlâ çalışıyor mu?
+                    elapsed = int(time.time() - started)
+                    if time.time() - last_beat >= 1:
+                        last_beat = time.time()
+                        phase, cur, total = last_progress
+                        self._msg_queue.put((
+                            "page_progress", row, cur, total, phase, elapsed,
+                        ))
                     if not process.is_alive():
-                        # Süreç kapandı ama "done"/"error" gelmediyse hata
-                        self._msg_queue.put(("status", row, FileRow.STATUS_ERROR,
-                                             "Süreç beklenmedik şekilde kapandı"))
-                        file_done = True
-                    continue
+                        leftover = None
+                        try:
+                            leftover = mp_queue.get_nowait()
+                        except Exception:
+                            pass
+                        if leftover and leftover[0] in ("done", "error"):
+                            msg = leftover
+                        else:
+                            errors += 1
+                            phase, cur, total = last_progress
+                            self._msg_queue.put((
+                                "status", row, FileRow.STATUS_ERROR,
+                                f"Süreç kapandı ({phase} {cur}/{total})",
+                            ))
+                            file_done = True
+                            continue
+                    else:
+                        continue
 
                 kind = msg[0]
                 if kind == "progress":
                     cur, total = msg[1], msg[2]
                     phase = msg[3] if len(msg) > 3 else "Sayfa"
-                    self._msg_queue.put(("page_progress", row, cur, total, phase))
+                    last_progress = (phase, cur, total)
+                    elapsed = int(time.time() - started)
+                    self._msg_queue.put((
+                        "page_progress", row, cur, total, phase, elapsed,
+                    ))
                 elif kind == "done":
                     done += 1
                     summary = msg[1] if len(msg) > 1 else ""
@@ -2515,17 +2674,20 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
                     file_done = True
                 elif kind == "error":
                     errors += 1
-                    self._msg_queue.put(("status", row, FileRow.STATUS_ERROR, msg[1]))
+                    short = msg[1] if len(msg) > 1 else "Bilinmeyen hata"
+                    detail = msg[2] if len(msg) > 2 else short
+                    self._msg_queue.put(("status", row, FileRow.STATUS_ERROR, short))
+                    self._msg_queue.put(("report", row, detail))
                     file_done = True
 
             process.join(timeout=5)
 
-        summary = f"✓ {done} dosya dönüştürüldü"
+        parts = [f"✓ {done} dosya dönüştürüldü"]
+        if cancelled:
+            parts.append(f"■ {cancelled} iptal")
         if errors:
-            summary += f"  ·  ✕ {errors} hata"
-        self._msg_queue.put(("done", summary))
-
-        # Başarılı dönüşüm varsa çıktı klasörlerini Explorer'da aç
+            parts.append(f"✕ {errors} hata")
+        self._msg_queue.put(("done", "  ·  ".join(parts)))
         if output_folders:
             self._msg_queue.put(("open_folders", output_folders))
 
@@ -2544,12 +2706,13 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
                 elif kind == "page_progress":
                     _, row, cur, total = msg[:4]
                     phase = msg[4] if len(msg) > 4 else "Sayfa"
-                    row.set_page_progress(cur, total, phase)
+                    elapsed = msg[5] if len(msg) > 5 else None
+                    row.set_page_progress(cur, total, phase, elapsed)
                 elif kind == "open_folders":
                     _, folders = msg
                     for folder in folders:
                         try:
-                            os.startfile(folder)  # Windows Explorer
+                            os.startfile(folder)
                         except Exception:
                             pass
                 elif kind == "report":
@@ -2563,23 +2726,18 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
                     _, row, diagnosis = msg
                     row.set_diagnosis(diagnosis)
                 elif kind == "diagnosis_error":
-                    _, row, _detail = msg
+                    _, row, detail = msg
                     row.set_diagnosis_text("Analiz edilemedi", "unknown")
+                    row.detail_label.configure(text=f"Teşhis hatası: {detail}")
+                    if not row.detail_label.winfo_ismapped():
+                        row.detail_label.pack(fill="x", pady=(6, 0))
                 elif kind == "bulk":
                     _, text = msg
                     if self.is_converting:
                         self.summary_label.configure(text=text)
                 elif kind == "done":
                     _, summary = msg
-                    self.is_converting = False
-                    self.add_btn.configure(state="normal")
-                    self.empty_add_btn.configure(state="normal")
-                    self.bulk_mode_menu.configure(state="normal")
-                    self.convert_btn.configure(
-                        text="Dönüştür",
-                        fg_color=COLORS["accent"],
-                        hover_color=COLORS["accent_hover"],
-                    )
+                    self._set_busy(False)
                     self.summary_label.configure(text=summary)
         except queue.Empty:
             pass

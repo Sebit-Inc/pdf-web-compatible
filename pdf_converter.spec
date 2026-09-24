@@ -6,6 +6,7 @@ Tek, bağımsız .exe oluşturur (onefile + noconsole).
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 # customtkinter kaynak dosyalarını bul
 import customtkinter
@@ -19,22 +20,40 @@ try:
 except ImportError:
     dnd_datas = []
 
+pike_datas, pike_binaries, pike_hiddenimports = collect_all("pikepdf")
+
 a = Analysis(
     ["app.py"],
     pathex=[],
-    binaries=[],
+    binaries=pike_binaries,
     datas=[
         (str(CTK_PATH), "customtkinter"),
         *dnd_datas,
         ("assets", "assets"),
+        *pike_datas,
     ],
     hiddenimports=[
         "customtkinter",
         "tkinterdnd2",
         "pymupdf",
+        "pikepdf",
         "darkdetect",
         "PIL",
         "PIL._tkinter_finder",
+        "pdf_web",
+        "pdf_web.config",
+        "pdf_web.util",
+        "pdf_web.engine",
+        "pdf_web.engine.analysis",
+        "pdf_web.engine.repair",
+        "pdf_web.engine.raster",
+        "pdf_web.engine.convert",
+        "pdf_web.ui",
+        "pdf_web.ui.window",
+        "pdf_web.ui.file_row",
+        "pdf_web.ui.dialogs",
+        "pdf_web.ui.tooltip",
+        *pike_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},

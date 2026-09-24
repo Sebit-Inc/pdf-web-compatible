@@ -20,7 +20,12 @@ COLORS = {
     "border":       "#2a3148",
 }
 
-APP_VERSION = "v1.0"
+APP_VERSION = "1.0.0"
+UPDATE_FEED_URL = (
+    "https://github.com/Sebit-Inc/pdf-web-compatible/"
+    "releases/latest/download/latest.json"
+)
+UPDATE_EXE_NAME = "PDF-Web-Donusturucu.exe"
 
 # 150'den 300'e 20'şer adımla + 300 (toplam 9 seçenek)
 DPI_VALUES = [150, 170, 190, 210, 230, 250, 270, 290, 300]

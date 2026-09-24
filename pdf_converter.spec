@@ -53,6 +53,7 @@ a = Analysis(
         "pdf_web.ui.file_row",
         "pdf_web.ui.dialogs",
         "pdf_web.ui.tooltip",
+        "pdf_web.updater",
         *pike_hiddenimports,
     ],
     hookspath=[],

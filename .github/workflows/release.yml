@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify version matches tag
+        run: |
+          python -c "import os; from pdf_web.config import APP_VERSION; tag=os.environ['GITHUB_REF_NAME'].lstrip('vV'); assert APP_VERSION == tag, f'APP_VERSION={APP_VERSION!r} tag={tag!r}'"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build exe
+        run: python -m PyInstaller pdf_converter.spec --clean --noconfirm
+
+      - name: Write latest.json
+        run: python tools/write_latest_json.py
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/PDF-Web-Donusturucu.exe" `
+            "dist/latest.json" `
+            --title "${{ github.ref_name }}" `
+            --notes "PDF Web Dönüştürücü ${{ github.ref_name }}"

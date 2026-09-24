@@ -25,7 +25,13 @@ from pdf_web.config import (
     _DEFAULT_DPI,
 )
 from pdf_web.engine.convert import _diagnose_process, _pdf_convert_process
-from pdf_web.ui.dialogs import show_about, show_mode_guide
+from pdf_web.ui.dialogs import (
+    UpdateProgressDialog,
+    show_about,
+    show_mode_guide,
+    show_update_available,
+    show_update_message,
+)
 from pdf_web.ui.file_row import FileRow
 from pdf_web.ui.tooltip import Tooltip
 from pdf_web.util import (
@@ -82,6 +88,8 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
         self._quality: str = QUALITY_RECOMMENDED
         self._about_window = None
         self._guide_window = None
+        self._update_window = None
+        self._update_checking = False
 
         # Teşhis kuyruğu: dosya eklenince yapısal ölçüm ayrı süreçte yapılır
         self._diag_queue: queue.Queue = queue.Queue()
@@ -92,6 +100,7 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
 
         # DnD kaydı
         self._setup_dnd(self)
+        self.after(1500, lambda: self.check_for_updates(silent=True))
 
     def _apply_window_icon(self) -> None:
         ico_path = _resource_path("assets/icon.ico")
@@ -468,6 +477,88 @@ class PDFConverterApp(ctk.CTk, TkinterDnD.DnDWrapper if DND_AVAILABLE else objec
 
     def _show_about(self):
         show_about(self)
+
+    def check_for_updates(self, silent: bool = True) -> None:
+        if self._update_checking:
+            return
+        self._update_checking = True
+
+        def worker() -> None:
+            from pdf_web.config import APP_VERSION
+            from pdf_web.updater import check_for_update
+
+            info = None
+            error = False
+            try:
+                info = check_for_update(APP_VERSION)
+            except Exception:
+                error = True
+            self.after(0, lambda i=info, e=error: self._on_update_check_done(i, silent, e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_check_done(self, info, silent: bool, error: bool) -> None:
+        self._update_checking = False
+        if error:
+            if not silent:
+                show_update_message(
+                    self,
+                    "Güncelleme kontrol edilemedi",
+                    "Sürüm bilgisi alınamadı. İnternet bağlantınızı kontrol edip tekrar deneyin.",
+                )
+            return
+        if info is None:
+            if not silent:
+                show_update_message(self, "Uygulama güncel", "Yüklü sürüm en son yayınlanan sürüm.")
+            return
+        show_update_available(self, info, self._begin_update)
+
+    def _begin_update(self, info) -> None:
+        if self.is_converting:
+            show_update_message(
+                self,
+                "Güncelleme bekliyor",
+                "Önce dönüştürmeyi bitirin veya iptal edin, sonra tekrar deneyin.",
+            )
+            return
+
+        from pdf_web.updater import apply_and_restart, download, download_dir_for, is_frozen
+
+        if not is_frozen():
+            import webbrowser
+            webbrowser.open(info.url)
+            show_update_message(
+                self,
+                "Kaynak koddan çalışıyor",
+                "Güncelleme yalnızca paketlenmiş exe'de kendini kurar. İndirme sayfası tarayıcıda açıldı.",
+            )
+            return
+
+        dialog = UpdateProgressDialog(self, info.version)
+        dest = download_dir_for(info.version)
+
+        def worker() -> None:
+            def progress(downloaded: int, total: int) -> None:
+                self.after(0, lambda d=downloaded, t=total: dialog.set_progress(d, t))
+
+            try:
+                path = download(info.url, dest, info.sha256, progress)
+            except Exception as exc:
+                self.after(0, lambda e=exc: dialog.set_error(str(e)))
+                return
+
+            def finish() -> None:
+                try:
+                    apply_and_restart(path)
+                except Exception as exc:
+                    dialog.set_error(str(exc))
+                    return
+                dialog.close()
+                self.destroy()
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _update_summary(self):
         n = len(self.file_rows)

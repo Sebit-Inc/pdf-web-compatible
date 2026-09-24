@@ -26,6 +26,10 @@ Web platformumuz, çok fazla vektörel çizim içeren PDF'leri bazı bilgisayarl
 
 `.exe` dosyası tüm bağımlılıklarını içinde taşır. Herhangi bir kurulum ya da ek yazılım gerekmez.
 
+## Güncellemeler
+
+Uygulama açılışta GitHub Releases üzerindeki `latest.json` dosyasına bakar. Yeni sürüm varsa bir iletişim kutusu çıkar; **Güncelle** indirir, dosyayı doğrular ve uygulamayı yeniden başlatır. Elle kontrol için **Hakkında → Güncellemeleri kontrol et**.
+
 ---
 
 ## Geliştirici Notları
@@ -50,6 +54,15 @@ python -m PyInstaller pdf_converter.spec --clean --noconfirm
 ```
 
 Çıktı: `dist/PDF-Web-Donusturucu.exe`
+
+### Yeni sürüm yayınlama
+
+1. [`pdf_web/config.py`](pdf_web/config.py) içinde `APP_VERSION` değerini yükseltin (`1.1.0` gibi).
+2. Commit edin, sonra tag atın: `git tag v1.1.0` ve `git push origin v1.1.0`.
+3. Tag, `APP_VERSION` ile birebir aynı olmalıdır (`v` öneki tag'de durur).
+4. GitHub Actions Windows üzerinde exe'yi derler, `latest.json` yazar ve bu reponun Releases sayfasına yükler.
+
+İlk updater'lı exe bir kez dağıtıldıktan sonra kullanıcılar sonraki sürümleri uygulama içinden alır.
 
 ### Nasıl Çalışır?
 1. Her PDF sayfası seçilen DPI'da piksel görüntüsüne render edilir (PyMuPDF)

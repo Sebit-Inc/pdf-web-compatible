@@ -157,15 +157,14 @@ def download_dir_for(version: str) -> Path:
     return Path(tempfile.gettempdir()) / name
 
 
-def updater_script(pid: int, source: Path, target: Path) -> str:
-    src = str(source)
-    dst = str(target)
+def updater_script() -> str:
+    """Yollar bat içine yazılmaz; Türkçe klasör adları ASCII encode hatası vermesin."""
     return (
         "@echo off\r\n"
         "setlocal EnableExtensions\r\n"
-        f"set \"PID={pid}\"\r\n"
-        f"set \"SRC={src}\"\r\n"
-        f"set \"DST={dst}\"\r\n"
+        "set \"PID=%~1\"\r\n"
+        "set \"SRC=%~2\"\r\n"
+        "set \"DST=%~3\"\r\n"
         "set /a n=0\r\n"
         ":wait\r\n"
         ">nul 2>&1 ping 127.0.0.1 -n 2\r\n"
@@ -197,11 +196,18 @@ def apply_and_restart(new_exe: Path) -> None:
         raise FileNotFoundError("İndirilen güncelleme bulunamadı.")
 
     script_path = Path(tempfile.gettempdir()) / "pdf-web-donusturucu-update.bat"
-    script_path.write_text(updater_script(os.getpid(), source, current), encoding="ascii")
+    script_path.write_text(updater_script(), encoding="ascii")
 
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
-        ["cmd.exe", "/c", str(script_path)],
+        [
+            "cmd.exe",
+            "/c",
+            str(script_path),
+            str(os.getpid()),
+            str(source),
+            str(current),
+        ],
         creationflags=creationflags,
         close_fds=True,
     )

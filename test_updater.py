@@ -1,7 +1,6 @@
 """Güncelleme denetimi ve sürüm karşılaştırma testleri."""
 
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from pdf_web.updater import (
@@ -61,10 +60,13 @@ class FeedTests(unittest.TestCase):
             self.assertIsNone(check_for_update("1.2.0"))
 
     def test_updater_script_contains_copy_and_restart(self):
-        script = updater_script(4242, Path("C:/temp/new.exe"), Path("C:/app/app.exe"))
-        self.assertIn("4242", script)
+        script = updater_script()
+        self.assertIn("%~1", script)
+        self.assertIn("%~2", script)
+        self.assertIn("%~3", script)
         self.assertIn("copy /y", script)
         self.assertIn("start \"\"", script)
+        script.encode("ascii")
 
 
 if __name__ == "__main__":

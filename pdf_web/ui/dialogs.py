@@ -19,6 +19,35 @@ from pdf_web.updater import UpdateInfo, format_app_version
 from pdf_web.util import _load_pdf_icon
 
 
+def _bring_to_front(win, app=None) -> None:
+    """Toplevel'ı diğer pencerelerin önüne alır; sürekli üstte bırakmaz."""
+    def drop_topmost() -> None:
+        if win.winfo_exists():
+            try:
+                win.attributes("-topmost", False)
+            except Exception:
+                pass
+
+    def raise_window() -> None:
+        if not win.winfo_exists():
+            return
+        try:
+            if app is not None and app.winfo_exists():
+                app.deiconify()
+                app.lift()
+            if app is not None:
+                win.transient(app)
+            win.deiconify()
+            win.lift()
+            win.attributes("-topmost", True)
+            win.focus_force()
+            win.after(400, drop_topmost)
+        except Exception:
+            pass
+
+    win.after(50, raise_window)
+
+
 def show_mode_guide(app) -> None:
     """Mod menüsündeki seçenekleri ve satırdaki teşhis etiketlerini anlatır."""
     if getattr(app, "_guide_window", None) is not None:
@@ -222,7 +251,7 @@ def show_about(app) -> None:
     ).pack(side="left")
 
     app._about_window = win
-    win.after(50, win.focus)
+    _bring_to_front(win, app)
 
 
 def show_update_message(app, title: str, message: str) -> None:
@@ -259,14 +288,13 @@ def show_update_message(app, title: str, message: str) -> None:
         font=ctk.CTkFont(size=13, weight="bold"),
         command=win.destroy,
     ).pack(pady=(18, 16))
-    win.after(50, win.focus)
+    _bring_to_front(win, app)
 
 
 def show_update_available(app, info: UpdateInfo, on_update: Callable[[UpdateInfo], None]) -> None:
     existing = getattr(app, "_update_window", None)
     if existing is not None and existing.winfo_exists():
-        existing.focus()
-        existing.lift()
+        _bring_to_front(existing, app)
         return
 
     win = ctk.CTkToplevel(app)
@@ -330,7 +358,7 @@ def show_update_available(app, info: UpdateInfo, on_update: Callable[[UpdateInfo
     ).pack(side="left")
 
     app._update_window = win
-    win.after(50, win.focus)
+    _bring_to_front(win, app)
 
 
 class UpdateProgressDialog:
@@ -358,8 +386,10 @@ class UpdateProgressDialog:
             card, text="Bağlanılıyor…",
             font=ctk.CTkFont(size=13),
             text_color=COLORS["text_muted"],
+            wraplength=340,
+            justify="center",
         )
-        self.status.pack()
+        self.status.pack(padx=16)
         self.progress = ctk.CTkProgressBar(
             card, width=280, height=10,
             progress_color=COLORS["accent"],
@@ -368,7 +398,7 @@ class UpdateProgressDialog:
         self.progress.pack(pady=(14, 8))
         self.progress.set(0)
         self.close_btn: Optional[ctk.CTkButton] = None
-        self.win.after(50, self.win.focus)
+        _bring_to_front(self.win, app)
 
     def set_progress(self, downloaded: int, total: int) -> None:
         if total > 0:

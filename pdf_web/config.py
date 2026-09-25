@@ -20,7 +20,7 @@ COLORS = {
     "border":       "#2a3148",
 }
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 UPDATE_FEED_URL = (
     "https://github.com/Sebit-Inc/pdf-web-compatible/"
     "releases/latest/download/latest.json"

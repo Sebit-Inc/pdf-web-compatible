@@ -157,6 +157,21 @@ def download_dir_for(version: str) -> Path:
     return Path(tempfile.gettempdir()) / name
 
 
+def _clean_restart_env() -> dict[str, str]:
+    """Eski onefile _MEI klasörünü yeni sürece taşıma."""
+    env = os.environ.copy()
+    for key in list(env):
+        upper = key.upper()
+        if (
+            upper.startswith("_MEI")
+            or upper.startswith("_PYI")
+            or upper in {"PYTHONHOME", "PYTHONPATH"}
+        ):
+            del env[key]
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def updater_script() -> str:
     """Yollar bat içine yazılmaz; Türkçe klasör adları ASCII encode hatası vermesin."""
     return (
@@ -172,13 +187,21 @@ def updater_script() -> str:
         "if %errorlevel%==0 goto wait\r\n"
         ":retry\r\n"
         "copy /y \"%SRC%\" \"%DST%\" >nul\r\n"
-        "if not errorlevel 1 goto done\r\n"
+        "if not errorlevel 1 goto copied\r\n"
         "set /a n+=1\r\n"
-        "if %n% geq 30 goto done\r\n"
+        "if %n% geq 30 goto copied\r\n"
         ">nul 2>&1 ping 127.0.0.1 -n 2\r\n"
         "goto retry\r\n"
-        ":done\r\n"
-        "start \"\" \"%DST%\"\r\n"
+        ":copied\r\n"
+        "set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
+        "set \"_MEIPASS=\"\r\n"
+        "set \"_MEIPASS2=\"\r\n"
+        "set \"_PYI_APPLICATION_HOME_DIR=\"\r\n"
+        "set \"_PYI_ARCHIVE_FILE=\"\r\n"
+        "set \"PYTHONHOME=\"\r\n"
+        "set \"PYTHONPATH=\"\r\n"
+        ">nul 2>&1 ping 127.0.0.1 -n 3\r\n"
+        "for %%I in (\"%DST%\") do start \"\" /D \"%%~dpI\" \"%DST%\"\r\n"
         "del /f /q \"%SRC%\" >nul 2>&1\r\n"
         "del /f /q \"%~f0\" >nul 2>&1\r\n"
     )
@@ -210,4 +233,6 @@ def apply_and_restart(new_exe: Path) -> None:
         ],
         creationflags=creationflags,
         close_fds=True,
+        env=_clean_restart_env(),
+        cwd=str(current.parent),
     )

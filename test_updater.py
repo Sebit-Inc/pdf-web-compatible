@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 from pdf_web.updater import (
+    _clean_restart_env,
     check_for_update,
     format_app_version,
     is_newer,
@@ -66,7 +67,20 @@ class FeedTests(unittest.TestCase):
         self.assertIn("%~3", script)
         self.assertIn("copy /y", script)
         self.assertIn("start \"\"", script)
+        self.assertIn("PYINSTALLER_RESET_ENVIRONMENT=1", script)
+        self.assertIn("_MEIPASS", script)
         script.encode("ascii")
+
+    def test_clean_restart_env_drops_pyinstaller_vars(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"_MEIPASS": "C:\\Temp\\_MEI1", "PATH": "C:\\Windows", "FOO": "bar"},
+            clear=False,
+        ):
+            env = _clean_restart_env()
+        self.assertNotIn("_MEIPASS", env)
+        self.assertEqual(env.get("PYINSTALLER_RESET_ENVIRONMENT"), "1")
+        self.assertEqual(env.get("FOO"), "bar")
 
 
 if __name__ == "__main__":
